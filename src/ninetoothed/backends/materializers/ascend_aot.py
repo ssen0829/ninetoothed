@@ -46,6 +46,14 @@ def _launch_source(source, entrypoint, block):
     return ast.unparse(ast.fix_missing_locations(function)) + "\n"
 
 
+def _compile_signature(compilation, triton_compile_signature):
+    entries = triton_compile_signature(compilation).split(",")
+
+    # Ascend does not support float64 tensors, but the shared Triton AOT
+    # signature promotes every floating-point scalar to float64.
+    return ",".join("fp32" if entry == "fp64" else entry for entry in entries)
+
+
 def build(compilation, *, output_dir):
     if any(spec.dtype is None for spec in compilation.kernel.tensors):
         raise ValueError("Ascend AOT requires explicit tensor dtypes at build time.")
@@ -63,7 +71,9 @@ def build(compilation, *, output_dir):
     from ninetoothed.backends.materializers.triton import (
         _compile_block,
         _compile_schedule,
-        _compile_signature,
+    )
+    from ninetoothed.backends.materializers.triton import (
+        _compile_signature as _triton_compile_signature,
     )
     from ninetoothed.compiler.runtime import Handle, import_python_module
 
@@ -75,7 +85,7 @@ def build(compilation, *, output_dir):
     source_path.write_text(artifact.primary_source, encoding="utf-8")
     module = import_python_module(source_path)
     kernel = getattr(module, f"{artifact.kernel_name}_kernel")
-    entries = _compile_signature(compilation).split(",")
+    entries = _compile_signature(compilation, _triton_compile_signature).split(",")
 
     if len(entries) != len(kernel.arg_names):
         raise ValueError("Ascend AOT kernel signature does not match the launch ABI.")
@@ -105,6 +115,21 @@ def build(compilation, *, output_dir):
     binary.write_bytes(compiled.kernel)
     shutil.copy2(compiled.run.launch.__self__.__file__, output / "launcher.so")
     shutil.copy2(driver.active.utils.npu_utils_mod.__file__, output / "npu_utils.so")
+    cpp_source = None
+
+    try:
+        from ninetoothed.backends.materializers.ascend_cpp import write_launcher
+
+        cpp_source = write_launcher(
+            compilation,
+            compiled,
+            signature,
+            binary,
+            output_dir,
+        )
+    except ValueError:
+        pass
+
     (output / "launch.py").write_text(
         _launch_source(
             artifact.primary_source, artifact.entrypoint, _compile_block(compilation)
@@ -134,7 +159,10 @@ def build(compilation, *, output_dir):
     )
     launch = load(built)
 
-    return Handle(compilation, compiled, launch, source_path, binary)
+    handle = Handle(compilation, compiled, launch, source_path, binary)
+    handle._cpp_source = None if cpp_source is None else str(cpp_source)
+
+    return handle
 
 
 def load(built):
