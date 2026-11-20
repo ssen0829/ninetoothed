@@ -180,6 +180,9 @@ class EmitterTarget(ABC):
     @abstractmethod
     def literal(self, value: Any) -> str: ...
 
+    def block_load(self, tensor, index, *, mask=None, other=0.0):
+        return self.load(tensor, index, mask=mask, other=other)
+
     @abstractmethod
     def load(
         self,
@@ -202,6 +205,9 @@ class EmitterTarget(ABC):
 
     @abstractmethod
     def cast(self, dtype: str, value: str) -> str: ...
+
+    def bitcast(self, dtype: str, value: str) -> str:
+        raise NotImplementedError("This backend does not support bitcast")
 
     def inline_constant(self, value: Any, type_: ssa.Type) -> str:
         del type_

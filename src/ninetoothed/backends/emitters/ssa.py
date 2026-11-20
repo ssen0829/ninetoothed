@@ -6,6 +6,7 @@ plans before lowering.  Backend-specific code is limited to spelling scalar
 expressions, loops, buffers, and launch wrappers.
 """
 
+import ast
 import json
 import re
 from dataclasses import replace
@@ -680,6 +681,39 @@ def _with_contiguous_1d_fast_path(
         layout_contiguous=True,
         vector_program=vector_program,
     )
+    # Initial rollout is deliberately limited to three validated pointwise
+    # kernels. Other kernels and all non-contiguous layouts keep generic code.
+    flat_names = {"ntops_lab_add", "ntops_lab_abs", "ntops_lab_gelu", "ntops_lab_neg", "ntops_lab_relu", "ntops_lab_square", "ntops_lab_exp", "ntops_lab_sqrt", "ntops_lab_sub", "ntops_lab_mul", "ntops_lab_div", "ntops_lab_reciprocal", "ntops_lab_rsqrt", "ntops_lab_log", "ntops_lab_ceil", "ntops_lab_floor", "ntops_lab_round", "ntops_lab_trunc", "ntops_lab_sin", "ntops_lab_cos"}
+    flat_enabled = (
+        kernel.kernel_name in flat_names
+        and not target.c_style_syntax
+        and target.vector_value_semantics
+        and not block_program
+        and all(len(info.source_shape) == 1 for info in logical_infos)
+    )
+    if flat_enabled:
+        extent = logical_infos[-1].source_shape[0]
+        pointer_names = {"x", "y", "out"}
+
+        class FlatContiguousAccess(ast.NodeTransformer):
+            def visit_Call(self, node):
+                self.generic_visit(node)
+                if (isinstance(node.func, ast.Attribute)
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "tl"
+                        and node.func.attr in {"load", "store"}):
+                    pointers = [n.id for n in ast.walk(node.args[0])
+                                if isinstance(n, ast.Name) and n.id in pointer_names]
+                    if len(set(pointers)) != 1:
+                        raise ValueError("Ambiguous flat pointwise pointer")
+                    node.args[0] = ast.parse(pointers[0] + " + index", mode="eval").body
+                    for keyword in node.keywords:
+                        if keyword.arg == "mask":
+                            keyword.value = ast.parse("index < " + extent, mode="eval").body
+                return node
+
+        contiguous_body = ast.unparse(ast.fix_missing_locations(
+            FlatContiguousAccess().visit(ast.parse(contiguous_body))))
     predicate = (
         " && ".join(f"({stride} == 1)" for stride in stride_params)
         if target.c_style_syntax
@@ -689,6 +723,10 @@ def _with_contiguous_1d_fast_path(
         )
     )
 
+    if flat_enabled:
+        predicate = _left_associative_boolean_chain((predicate,) + tuple(
+            f"({info.source_shape[0]} == {extent})" for info in logical_infos
+        ), operator="and")
     if target.c_style_syntax:
         return (
             f"if ({predicate}) {{\n"
@@ -1966,6 +2004,15 @@ def _render_scalar_expr(
     name = opcode.split(".", 1)[1]
 
     if opcode.startswith(("math.", "call.")):
+        if name == "arange" and target.vector_value_semantics:
+            args = tuple(
+                target.literal(ctx.operations[item].attrs["value"])
+                if item in ctx.operations and ctx.operations[item].opcode == "arith.constant"
+                else _operation_expr(ctx.operations[item], ctx)
+                if item in ctx.operations and ctx.operations[item].opcode in {"symbol.attr", "shape.dim"}
+                else value
+                for item, value in zip(op.operands, args)
+            )
         if target.vector_value_semantics and "libdevice." in str(
             op.attrs.get("callee", "")
         ):
@@ -1975,7 +2022,10 @@ def _render_scalar_expr(
     args = target.coerce_binary_args(op, args, ctx)
 
     if name in _UNARY:
-        return f"({_UNARY[name]}{args[0]})"
+        operator = _UNARY[name]
+        if name == "not" and not target.c_style_syntax:
+            return f"({args[0]} == False)"
+        return f"({operator}{args[0]})"
 
     if name in {"maximum", "max", "minimum", "min", "pow"}:
         return target.call(name, args)
@@ -2426,6 +2476,14 @@ def _masked_load(
     ctx: _EmitContext,
 ) -> str:
     other = _load_other(info)
+    if (
+        ctx.block_program
+        and mask is not None
+        and _value_axes(name, ctx) == tuple(str(axis) for axis in ctx.output_axes)
+    ):
+        # Expanded inputs may have a 1xC address and an MxC validity mask.
+        # Broadcast the address to the arranged value domain before loading.
+        return ctx.target.block_load(name, source_index, mask=mask, other=other)
     load = ctx.target.load(name, source_index, mask=mask, other=other)
 
     if ctx.target.c_style_syntax and mask is not None:
@@ -3350,6 +3408,18 @@ def _source_index(info: _TensorInfo | None, view_index: str) -> str:
     return _replace_index_symbol(expr, view_index)
 
 
+def _direct_block_coords(view_index, shape, ctx):
+    if not ctx.block_program:
+        return None
+    coords = ctx.target.block_coords(tuple(shape))
+    linear = _linearized_index(coords, tuple(shape))
+    # Reuse only when this access is exactly the linearization of its own
+    # block domain, including inputs whose output has reduced rank.
+    if _target_index_expr(ctx.target, view_index) == _target_index_expr(ctx.target, linear):
+        return coords
+    return None
+
+
 def _source_index_for_value(
     info: _TensorInfo | None,
     view_index: str,
@@ -3370,7 +3440,15 @@ def _source_index_for_value(
     coords = (
         value_coords
         if len(value_coords) == len(shape)
-        else _coords_from_linear(view_index, shape, ctx.target)
+        else ctx.coordinate_exprs
+        if (
+            ctx.block_program
+            and view_index == ctx.inner_index_expr
+            and shape == tuple(str(axis) for axis in ctx.output_axes)
+            and len(ctx.coordinate_exprs) == len(shape)
+        )
+        else _direct_block_coords(view_index, shape, ctx)
+        or _coords_from_linear(view_index, shape, ctx.target)
     )
     replacements = {"outer_index": ctx.outer_index_expr}
     replacements.update({f"value_{index}": coord for index, coord in enumerate(coords)})
@@ -3658,7 +3736,15 @@ def _combined_mask(
             coords = (
                 value_coords
                 if len(value_coords) == len(shape)
-                else _coords_from_linear(view_index, shape, target)
+                else ctx.coordinate_exprs
+                if (
+                    ctx.block_program
+                    and view_index == ctx.inner_index_expr
+                    and tuple(shape) == tuple(str(axis) for axis in ctx.output_axes)
+                    and len(ctx.coordinate_exprs) == len(shape)
+                )
+                else _direct_block_coords(view_index, shape, ctx)
+                or _coords_from_linear(view_index, shape, target)
             )
             replacements = {"outer_index": ctx.outer_index_expr}
             replacements.update(
@@ -4362,6 +4448,8 @@ def _resolved_cast_dtype(op: ssa.Operation, ctx: _EmitContext) -> str:
 
 
 def _cast_value(op: ssa.Operation, value: str, ctx: _EmitContext) -> str:
+    if op.attrs.get("bitcast"):
+        return ctx.target.bitcast(_resolved_cast_dtype(op, ctx), value)
     ref = op.operands[1] if len(op.operands) > 1 else op.attrs.get("dtype_ref")
 
     if ref is not None:

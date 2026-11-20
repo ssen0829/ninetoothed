@@ -33,6 +33,7 @@ _OPERATIONS = frozenset(
         "arith.maximum",
         "arith.minimum",
         "math.exp",
+        "math.erf",
         "math.exp2",
         "math.log",
         "math.log2",
@@ -43,6 +44,10 @@ _OPERATIONS = frozenset(
         "reduce.sum",
         "reduce.max",
         "reduce.min",
+        "select.where",
+        "cmp.eq",
+        "cmp.lt",
+        "cmp.gt",
         "mem.store",
     }
 )
@@ -54,7 +59,7 @@ class TritonBlockReductions(Pass):
     name = "ssa.triton.block_reductions"
     category = LANGUAGE_SPECIFIC
     phase = "optimization"
-    supported_backends = (Target.TRITON,)
+    supported_backends = (Target.TRITON, Target.ASCEND)
     default_enabled = False
 
     def run(self, program, context):
@@ -84,8 +89,8 @@ class TritonBlockReductions(Pass):
 
 
 def _rejection(program, context, schedule, *, max_block_elements, max_total_elements):
-    if context.resolved_target.backend != Target.TRITON:
-        return "requires the Triton backend"
+    if context.resolved_target.backend not in {Target.TRITON, Target.ASCEND}:
+        return "requires a Triton-language backend"
 
     if schedule.get("reduction", {}).get("mode") == "row-vector":
         return "preserve the existing row-vector schedule"

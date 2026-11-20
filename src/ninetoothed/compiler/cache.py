@@ -39,7 +39,10 @@ def stable_digest(value: Any) -> str:
 def triton_cache_directory(root: Path) -> Path:
     """Isolate native launchers compiled against different runtime environments."""
     identity = {
-        "schema": 1,
+        "schema": 2,
+        "ascend_all_blocks_parallel": os.environ.get(
+            "TRITON_ALL_BLOCKS_PARALLEL", "false"
+        ).lower() in {"true", "1"},
         "versions": _compiler_versions(),
         "executable": sys.executable,
         "prefix": sys.prefix,

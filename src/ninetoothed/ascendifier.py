@@ -1,4 +1,5 @@
 import ast
+import importlib.util
 
 
 class Ascendifier(ast.NodeTransformer):
@@ -15,7 +16,33 @@ class Ascendifier(ast.NodeTransformer):
 
     def transform(self, source: str) -> str:
         tree = self.visit(ast.parse(source))
+        # Flat masked kernels tolerate extra logical programs. Align their
+        # grid to physical vector cores to avoid duplicate first-tile work
+        # in the installed Ascend auto-blockify loop's partial final wave.
+        flat_masked = ("offsets = tl.program_id(0) * BLOCK" in source
+                       and "mask = offsets <" in source
+                       and "tl.sum(" not in source and "tl.dot(" not in source)
+        for node in ast.walk(tree):
+            if (flat_masked and isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id == "grid"
+                    and isinstance(node.value, ast.Tuple)
+                    and len(node.value.elts) == 1):
+                count = node.value.elts[0]
+                node.value.elts[0] = ast.parse(
+                    f"triton.cdiv({ast.unparse(count)}, _nt_vector_cores) * _nt_vector_cores", mode="eval"
+                ).body
+        if any(isinstance(n, ast.Name) and n.id in
+               {'_nt_ascend_fmod', '_nt_ascend_copysign'} for n in ast.walk(tree)):
+            from ninetoothed.ascend_math_source import FMOD_SOURCE
+            position = next((i for i, n in enumerate(tree.body)
+                             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))), len(tree.body))
+            tree.body[position:position] = ast.parse(FMOD_SOURCE).body
 
+        if flat_masked:
+            tree.body[0:0] = ast.parse(
+                "from triton.backends.ascend.runtime.utils import num_vector_core as _nt_vector_cores"
+            ).body
         return ast.unparse(ast.fix_missing_locations(tree)) + "\n"
 
     @staticmethod
@@ -154,12 +181,24 @@ class Ascendifier(ast.NodeTransformer):
         if node.module == "triton.language.extra":
             for alias in node.names:
                 if alias.name == "libdevice":
-                    node.module = "triton.language.extra.ascend"
+                    # Triton-Ascend releases have used both namespaces.  The
+                    # current environment ships the CANN namespace, while
+                    # newer packages may expose ``extra.ascend``.
+                    node.module = (
+                        "triton.language.extra.ascend"
+                        if importlib.util.find_spec("triton.language.extra.ascend")
+                        else "triton.language.extra.cann"
+                    )
 
         return node
 
     def visit_Call(self, node):
         self.generic_visit(node)
+        if (isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == 'libdevice'
+                and node.func.attr in {'fmod', 'copysign'}):
+            node.func = ast.Name(id='_nt_ascend_' + node.func.attr, ctx=ast.Load())
 
         if type(self)._is_triton_autotune_call(node):
             type(self)._rewrite_autotune_call(node, self.max_axes)

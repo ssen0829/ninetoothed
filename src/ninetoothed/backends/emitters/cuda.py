@@ -121,6 +121,12 @@ class CudaTarget(EmitterTarget):
         return f"(({cond}) ? ({yes}) : ({no}))"
 
     def call(self, name, args):
+        if name == "round":
+            return f"nearbyintf({args[0]})"
+
+        if name == "relu":
+            return f"(isnan({args[0]}) ? ({args[0]}) : fmaxf({args[0]}, 0.0f))"
+
         if name == "where":
             return self.where(args[0], args[1], args[2])
 

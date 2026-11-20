@@ -664,6 +664,9 @@ class _PreparedBoundValue:
         ):
             return value, None
 
+        if value.ndim == 1 and value.stride() == (1,):
+            return value, None
+
         storage_numel = value.untyped_storage().nbytes() // value.element_size()
         storage_offset = value.storage_offset()
         flattened = value.as_strided(
@@ -929,6 +932,8 @@ def _verified_runtime_launch(launch):
         return prepared
 
     def verified(*args, **kwargs):
+        if getattr(launch, "_ninetoothed_direct_checked_launch", False):
+            return launch(*args, **kwargs)
         active_snapshot = active
         active_identity_snapshot = active_identity
         call_key = (
@@ -1108,6 +1113,11 @@ def _runtime_wrapper(
             return result
         return _first_output_from_call(abi, args, kwargs)
 
+    metadata_binding_cache = {}
+    allocating_pointwise = (getattr(function, "__name__", "") in {
+        "launch_ntops_lab_add", "launch_ntops_lab_abs", "launch_ntops_lab_gelu"
+    } or getattr(function, "__name__", "").startswith("launch_ntops_lab_row_block_"))
+
     def launch(*args, **kwargs):
         public = _public_values(
             abi,
@@ -1124,11 +1134,36 @@ def _runtime_wrapper(
         if _empty_launch(abi, public):
             return _first_output(abi, public)
 
-        values, keepalive = _bound_values(
-            abi,
-            bound_public,
-            scalar_mode="value",
-        )
+        # Cache metadata only, never tensor objects or device pointers. Public
+        # contracts and binding validation above still run on every invocation.
+        reusable = allocating_pointwise and all(
+            b.kind in {"tensor", "shape", "stride", "meta"}
+            for b in abi.kernel_args
+        ) and not overrides
+        signature = None
+        if reusable:
+            signature = tuple(
+                (name, tuple(v.shape), tuple(v.stride()), v.dtype, v.device)
+                for name, v in public.items()
+                if hasattr(v, "shape") and hasattr(v, "stride")
+            ) + tuple(
+                (name, type(v), v) for name, v in public.items()
+                if not hasattr(v, "shape")
+            )
+        template = metadata_binding_cache.get(signature) if reusable else None
+        if template is None:
+            values, keepalive = _bound_values(abi, bound_public, scalar_mode="value")
+            if reusable:
+                if len(metadata_binding_cache) >= 8:
+                    metadata_binding_cache.pop(next(iter(metadata_binding_cache)))
+                metadata_binding_cache[signature] = tuple(
+                    None if b.kind == "tensor" else v
+                    for b, v in zip(abi.kernel_args, values)
+                )
+        else:
+            values = [bound_public[b.source] if b.kind == "tensor" else v
+                      for b, v in zip(abi.kernel_args, template)]
+            keepalive = []
 
         if low_level:
             values, flattened = _flatten_ffi_tensor_args(abi.kernel_args, values)
@@ -1141,6 +1176,11 @@ def _runtime_wrapper(
             return result
         return _first_output(abi, public)
 
+    # These allocating pointwise wrappers change output identity every call.
+    # Direct checked binding avoids building a prepared plan that cannot hit.
+    launch._ninetoothed_direct_checked_launch = (getattr(function, "__name__", "") in {
+        "launch_ntops_lab_add", "launch_ntops_lab_abs", "launch_ntops_lab_gelu"
+    } or getattr(function, "__name__", "").startswith("launch_ntops_lab_row_block_"))
     launch._ninetoothed_prepare = prepare
     launch._ninetoothed_invoke_prepared = invoke
 
@@ -1344,7 +1384,9 @@ def _flatten_ffi_tensor_args(bindings, values):
             "tensor",
             "jagged_values",
             "jagged_offsets",
-        } and hasattr(value, "as_strided"):
+        } and hasattr(value, "as_strided") and not (
+            value.ndim == 1 and value.stride() == (1,)
+        ):
             storage_numel = value.untyped_storage().nbytes() // value.element_size()
             storage_offset = value.storage_offset()
             value = value.as_strided(

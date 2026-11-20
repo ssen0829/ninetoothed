@@ -13,6 +13,7 @@ import re
 import textwrap
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
+from dataclasses import replace
 from typing import Any
 
 from ninetoothed.frontend.errors import LoweringError
@@ -1021,14 +1022,20 @@ class _ApplicationSSABuilder:
         name = _call_leaf_name(node.func)
 
         if name == "cast":
-            if len(node.args) != 2 or node.keywords:
+            if len(node.args) != 2 or any(k.arg != "bitcast" for k in node.keywords):
                 raise _lowering_error(
                     node, "`cast()` requires an input value and a destination dtype"
                 )
 
             value = self._lower_expr(node.args[0], operations, env)
 
-            return self._lower_cast(value, node.args[1], operations, env)
+            result = self._lower_cast(value, node.args[1], operations, env)
+            if node.keywords:
+                bitcast = _literal_value(node.keywords[0].value)
+                if not isinstance(bitcast, bool):
+                    raise _lowering_error(node, "bitcast must be a literal bool")
+                operations[-1] = replace(operations[-1], attrs=dict(operations[-1].attrs) | {"bitcast": bitcast})
+            return result
 
         constructor = self._lower_constructor_call(name, node, operations, env)
 
@@ -1064,8 +1071,10 @@ class _ApplicationSSABuilder:
         if literal == "-inf":
             return self._constant(operations, float("-inf"))
 
-        if literal == "inf":
+        if literal in {"inf", "+inf"}:
             return self._constant(operations, float("inf"))
+        if literal == "nan":
+            return self._constant(operations, float("nan"))
         return None
 
     def _lower_tensor_method_call(self, node, operations, env):
@@ -1128,7 +1137,7 @@ class _ApplicationSSABuilder:
             owner = dtype_node.value
 
             while isinstance(owner, ast.Subscript) or (
-                isinstance(owner, ast.Attribute) and owner.attr == "source"
+                isinstance(owner, ast.Attribute) and owner.attr in {"source", "dtype"}
             ):
                 owner = owner.value
 
@@ -1388,7 +1397,10 @@ class _ApplicationSSABuilder:
                 operations,
                 "select.where",
                 operands=tuple(value.name for value in operands),
-                result_type=_broadcast_type(operands[1].type, operands[2].type),
+                result_type=replace(
+                    operands[0].type,
+                    dtype=_broadcast_type(operands[1].type, operands[2].type).dtype,
+                ) if operands[0].type.kind == "tensor" and all(value.type.kind == "scalar" for value in operands[1:]) else _broadcast_type(operands[1].type, operands[2].type),
             )
 
         if name in {"maximum", "minimum"}:
@@ -1545,7 +1557,7 @@ class _ApplicationSSABuilder:
         attr_value: Any = value
 
         if isinstance(value, float) and not math.isfinite(value):
-            attr_value = "-inf" if value < 0 else "inf"
+            attr_value = "nan" if math.isnan(value) else "-inf" if value < 0 else "inf"
         return self._emit(
             operations,
             "arith.constant",

@@ -121,6 +121,12 @@ class TileLangTarget(EmitterTarget):
         return f"T.if_then_else({cond}, {yes}, {no})"
 
     def call(self, name, args):
+        if name == "round":
+            return f"T.round({args[0]})"
+
+        if name == "relu":
+            return f"T.max({args[0]}, 0.0)"
+
         if name == "where":
             return self.where(args[0], args[1], args[2])
 

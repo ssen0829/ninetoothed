@@ -29,3 +29,13 @@ def test_native_launcher_cache_changes_with_python_environment(monkeypatch, tmp_
     original = cache.triton_cache_directory(tmp_path)
     monkeypatch.setattr(cache.sys, "prefix", "/another/environment")
     assert cache.triton_cache_directory(tmp_path) != original
+
+
+def test_cache_separates_ascend_parallel_block_configuration(tmp_path, monkeypatch):
+    monkeypatch.delenv('TRITON_ALL_BLOCKS_PARALLEL', raising=False)
+    serial = cache.triton_cache_directory(tmp_path)
+    monkeypatch.setenv('TRITON_ALL_BLOCKS_PARALLEL', '1')
+    parallel = cache.triton_cache_directory(tmp_path)
+    assert parallel != serial
+    monkeypatch.setenv('TRITON_ALL_BLOCKS_PARALLEL', 'true')
+    assert cache.triton_cache_directory(tmp_path) == parallel

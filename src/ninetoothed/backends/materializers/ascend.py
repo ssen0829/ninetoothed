@@ -64,6 +64,15 @@ def _materialize_ascend(compilation: Any):
     launch = getattr(module, artifact.entrypoint)
     kernel = getattr(module, f"{artifact.kernel_name}_kernel", None)
 
+    if (
+        (artifact.kernel_name in {"ntops_lab_add", "ntops_lab_abs", "ntops_lab_gelu"}
+         or artifact.kernel_name.startswith("ntops_lab_row_block_"))
+        and os.environ.get("NINETOOTHED_COMPILED_DISPATCH", "1") == "1"
+    ):
+        from .compiled_dispatch import _CompiledDispatch
+
+        module.__dict__[f"{artifact.kernel_name}_kernel"] = _CompiledDispatch(kernel)
+
     # 3. 封装 Python 运行时 Launch.
     wrapped = _verified_runtime_launch(
         _runtime_wrapper(

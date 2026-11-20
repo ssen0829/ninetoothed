@@ -135,3 +135,83 @@ def test_block_reduction_loads_each_input_domain(device):
 
         DEFAULT_COMPILER.materialize(compilation)(x, y, out)
         torch.testing.assert_close(out, torch.full_like(out, 120), rtol=0, atol=0)
+
+
+def _row_arrangement(x, out):
+    return x.tile((16, -1)), out.tile((16, -1))
+
+
+def _row_application(x, out):
+    shifted = x - ntl.max(x, axis=1)[:, None]
+    out = shifted - ntl.log(ntl.sum(ntl.exp(shifted), axis=1))[:, None]
+
+
+@pytest.mark.parametrize("backend", ("triton", "ascend"))
+def test_block_coordinates_preserve_two_dimensional_access(backend):
+    passes = tuple(
+        name for name in default_spec(backend).passes
+        if name not in {
+            "ssa.select_schedule", "ssa.triton.optimize_schedule",
+            "ssa.ascend.optimize_schedule",
+        }
+    )
+    request = CompileRequest(
+        arrangement=_row_arrangement,
+        application=_row_application,
+        tensors=(Tensor(shape=(33, 32), dtype=float32, other=float("-inf")),
+                 Tensor(shape=(33, 32), dtype=float32)),
+        backend=backend,
+        pipeline=(*passes[:-1], PASS, passes[-1]),
+        max_num_configs=1,
+    )
+    compilation = DEFAULT_COMPILER.compile(request)
+    source = compilation.artifact.primary_source
+    assert compilation.artifact.metadata["ssa_metadata"]["schedule"][
+        "block_reductions"
+    ]["enabled"]
+    assert "axis=1" in source
+    # Recovering each lane from a flattened block defeats efficient 2D access.
+    load_store = [line for line in source.splitlines()
+                  if "tl.load(" in line or "tl.store(" in line]
+    assert load_store
+    assert all("// 32" not in line for line in load_store)
+
+
+def _comparison_application(x, out):
+    value = x - ntl.sum(x, axis=1)[:, None]
+    value = ntl.where(value < 0.0, -value, value)
+    out = ntl.where(value > 1.0, 1.0, value)
+
+
+@pytest.mark.parametrize("backend", ("triton", "ascend"))
+def test_block_reduction_comparison_selection(backend):
+    passes = tuple(p for p in default_spec(backend).passes
+                   if p not in {"ssa.select_schedule", "ssa.triton.optimize_schedule",
+                                "ssa.ascend.optimize_schedule"})
+    compilation = DEFAULT_COMPILER.compile(CompileRequest(
+        arrangement=_row_arrangement, application=_comparison_application,
+        tensors=(Tensor(shape=(33,32),dtype=float32),Tensor(shape=(33,32),dtype=float32)),
+        backend=backend,pipeline=(*passes[:-1],PASS,passes[-1]),max_num_configs=1))
+    assert compilation.artifact.metadata["ssa_metadata"]["schedule"]["block_reductions"]["enabled"]
+    source = compilation.artifact.primary_source
+    assert "tl.where(" in source
+    assert "tl.sum(" in source
+    assert "for " not in source
+
+
+def _erf_application(x, out):
+    value = x - ntl.sum(x, axis=1)[:, None]
+    out = 0.5 * value * (1.0 + ntl.erf(value * 0.7071067811865476))
+
+
+@pytest.mark.parametrize("backend", ("triton", "ascend"))
+def test_block_reduction_erf(backend):
+    passes = tuple(p for p in default_spec(backend).passes
+                   if p not in {"ssa.select_schedule", "ssa.triton.optimize_schedule",
+                                "ssa.ascend.optimize_schedule"})
+    compilation = DEFAULT_COMPILER.compile(CompileRequest(
+        arrangement=_row_arrangement, application=_erf_application,
+        tensors=(Tensor(shape=(33,32),dtype=float32),Tensor(shape=(33,32),dtype=float32)),
+        backend=backend,pipeline=(*passes[:-1],PASS,passes[-1]),max_num_configs=1))
+    assert compilation.artifact.metadata["ssa_metadata"]["schedule"]["block_reductions"]["enabled"]
+    assert "tl.erf(" in compilation.artifact.primary_source
